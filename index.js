@@ -1,5 +1,6 @@
 const http = require("http");
 const crypto = require("crypto");
+const fs = require("fs");
 const { Telegraf, Markup } = require("telegraf");
 
 // ---------- CONFIG ----------
@@ -39,6 +40,58 @@ const esc = (s = "") =>
 // Keep the process alive on unexpected errors
 process.on("unhandledRejection", (e) => console.error("Unhandled rejection:", e));
 process.on("uncaughtException", (e) => console.error("Uncaught exception:", e));
+
+// ---------- PREMIUM STORE ----------
+const DB_FILE = process.env.DB_FILE || "./data.json";
+const ADMIN_IDS = (process.env.ADMIN_ID || "").split(",").map((s) => s.trim()).filter(Boolean);
+const PLANS = {
+  w: { days: 7, stars: Number(process.env.PRICE_WEEK) || 75, label: "7 days" },
+  m: { days: 30, stars: Number(process.env.PRICE_MONTH) || 250, label: "30 days" },
+};
+const FREE_GROK_PER_DAY = 1;
+
+let db = { users: {}, premium: {}, follow: {}, payments: [] };
+try {
+  db = { ...db, ...JSON.parse(fs.readFileSync(DB_FILE, "utf8")) };
+} catch {}
+
+let saveTimer = null;
+const save = () => {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(DB_FILE, JSON.stringify(db));
+    } catch (e) {
+      console.error("DB save failed:", e.message);
+    }
+  }, 500);
+};
+
+const isAdmin = (id) => ADMIN_IDS.includes(String(id));
+const premiumUntil = (id) => db.premium[id] || 0;
+const isPremium = (id) => isAdmin(id) || premiumUntil(id) > Date.now();
+const fmtDate = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+function addPremium(id, days) {
+  const base = Math.max(Date.now(), premiumUntil(id));
+  db.premium[id] = base + days * 86400000;
+  save();
+  return db.premium[id];
+}
+
+// Free daily Grok quota (resets each UTC day)
+const grokFree = new Map(); // userId -> { day, n }
+const today = () => new Date().toISOString().slice(0, 10);
+function grokQuotaLeft(id) {
+  const q = grokFree.get(id);
+  if (!q || q.day !== today()) return FREE_GROK_PER_DAY;
+  return Math.max(0, FREE_GROK_PER_DAY - q.n);
+}
+function useGrokQuota(id) {
+  const q = grokFree.get(id);
+  if (!q || q.day !== today()) grokFree.set(id, { day: today(), n: 1 });
+  else q.n++;
+}
 
 // ---------- API + CACHE ----------
 const cache = new Map();
@@ -301,6 +354,10 @@ function valueKb(code, hid, aid, mk) {
 // ---------- SCREENS ----------
 const homeKb = () => {
   const rows = Object.entries(LEAGUES).map(([c, n]) => [Markup.button.callback(n, "lg:" + c)]);
+  rows.push([
+    Markup.button.callback("📡 Live Scores", "live"),
+    Markup.button.callback("💎 Premium", "premium"),
+  ]);
   if (webUrl()) rows.push([Markup.button.webApp("🌐 Open Web App", webUrl())]);
   rows.push([Markup.button.callback("ℹ️ How it works", "about")]);
   return Markup.inlineKeyboard(rows);
@@ -309,7 +366,7 @@ const homeKb = () => {
 const homeText = (ctx) =>
   `⚽ <b>Sporty Predictor AI</b>\n\n` +
   `👋 Hi <b>${esc(ctx.from.first_name)}</b>!\n` +
-  `<blockquote>📊 Poisson model\n📈 Team form\n💰 Odds &amp; value check\n🤖 Grok AI analysis\n🌐 Web app</blockquote>\n` +
+  `<blockquote>📊 Poisson model\n📈 Team form\n💰 Odds &amp; value check\n🤖 Grok AI analysis\n🌐 Web app\n📡 Live scores &amp; goal alerts\n💎 Premium</blockquote>\n` +
   `Pick a league 👇\n<i>Stats-based estimates, not guarantees.</i>`;
 
 const sendHome = (ctx, edit) =>
@@ -373,8 +430,16 @@ const sendJoin = (ctx, results) =>
 bot.use(async (ctx, next) => {
   if (!ctx.from || ctx.from.is_bot) return next();
   if (ctx.callbackQuery && ctx.callbackQuery.data === "verify") return next();
+  // never block payment events
+  if (ctx.updateType === "pre_checkout_query" || (ctx.message && ctx.message.successful_payment)) return next();
   const res = await checkMembership(ctx.from.id);
-  if (res.ok) return next();
+  if (res.ok) {
+    if (!db.users[ctx.from.id]) {
+      db.users[ctx.from.id] = Date.now();
+      save();
+    }
+    return next();
+  }
   if (ctx.callbackQuery) {
     await ctx.answerCbQuery("🔒 Join our channels first", { show_alert: true }).catch(() => {});
   }
@@ -403,8 +468,308 @@ bot.action("verify", async (ctx) => {
 bot.start((ctx) => sendHome(ctx));
 bot.command("menu", (ctx) => sendHome(ctx));
 bot.help((ctx) =>
-  ctx.reply("<b>Commands</b>\n/start - Open predictor\n/menu - Show leagues", { parse_mode: "HTML" })
+  ctx.reply("<b>Commands</b>\n/start - Open predictor\n/menu - Show leagues\n/live - Live scores\n/premium - Premium plans\n/paysupport - Payment help", { parse_mode: "HTML" })
 );
+
+// ---------- PREMIUM ----------
+const premiumPerks =
+  `<blockquote>🤖 Unlimited Grok AI analysis\n💰 Odds &amp; value check\n🔥 Top Picks\n🔔 Live goal alerts\n🌐 Premium web app tools</blockquote>`;
+
+const planRows = () =>
+  Object.entries(PLANS).map(([k, p]) => [
+    Markup.button.callback(`⭐ ${p.label} · ${p.stars} Stars`, `buy:${k}`),
+  ]);
+
+function premiumView(id) {
+  const until = premiumUntil(id);
+  const status = isAdmin(id)
+    ? "👑 Admin access"
+    : until > Date.now()
+    ? `✅ Active until <b>${fmtDate(until)}</b>`
+    : "❌ Not active";
+  return {
+    text:
+      `💎 <b>Premium</b>\n\nStatus: ${status}\n\n${premiumPerks}\n` +
+      `<b>Free plan:</b> predictions, live scores and ${FREE_GROK_PER_DAY} Grok analysis per day.\n\n` +
+      `<i>Pay securely with Telegram Stars ⭐. Pick a plan:</i>`,
+    kb: Markup.inlineKeyboard([...planRows(), [Markup.button.callback("🏠 Home", "home")]]),
+  };
+}
+
+// Shown when a free user taps a premium feature
+async function wall(ctx, feature) {
+  await ctx.answerCbQuery("💎 Premium feature").catch(() => {});
+  const text =
+    `🔒 <b>${feature}</b> is a 💎 <b>Premium</b> feature.\n\n${premiumPerks}\n<i>Pick a plan to unlock it:</i>`;
+  const kb = Markup.inlineKeyboard([...planRows(), [Markup.button.callback("🏠 Home", "home")]]);
+  try {
+    if (ctx.callbackQuery) await safeEdit(ctx, text, kb);
+    else await ctx.reply(text, { parse_mode: "HTML", ...kb });
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+bot.command("premium", (ctx) => {
+  const v = premiumView(ctx.from.id);
+  return ctx.reply(v.text, { parse_mode: "HTML", ...v.kb });
+});
+
+bot.action("premium", async (ctx) => {
+  await ctx.answerCbQuery();
+  try {
+    const v = premiumView(ctx.from.id);
+    await safeEdit(ctx, v.text, v.kb);
+  } catch (e) {
+    fail(ctx, e);
+  }
+});
+
+// Buy with Telegram Stars (currency XTR, no provider token)
+bot.action(/^buy:(\w)$/, async (ctx) => {
+  const key = ctx.match[1];
+  const plan = PLANS[key];
+  if (!plan) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  try {
+    await ctx.telegram.callApi("sendInvoice", {
+      chat_id: ctx.chat.id,
+      title: `Premium · ${plan.label}`,
+      description: `Unlock Grok AI, odds check, Top Picks and live goal alerts for ${plan.label}.`,
+      payload: `prem:${key}:${ctx.from.id}`,
+      provider_token: "",
+      currency: "XTR",
+      prices: [{ label: `Premium ${plan.label}`, amount: plan.stars }],
+    });
+  } catch (e) {
+    fail(ctx, e);
+  }
+});
+
+bot.on("pre_checkout_query", async (ctx) => {
+  const [, key, uid] = String(ctx.preCheckoutQuery.invoice_payload).split(":");
+  const ok = !!PLANS[key] && String(ctx.from.id) === uid;
+  await ctx.answerPreCheckoutQuery(ok, ok ? undefined : "Invalid order").catch(console.error);
+});
+
+bot.on("successful_payment", async (ctx) => {
+  const pay = ctx.message.successful_payment;
+  const [, key] = String(pay.invoice_payload).split(":");
+  const plan = PLANS[key];
+  if (!plan) return;
+  const until = addPremium(ctx.from.id, plan.days);
+  db.payments.push({
+    user: ctx.from.id,
+    plan: key,
+    stars: pay.total_amount,
+    charge: pay.telegram_payment_charge_id,
+    t: Date.now(),
+  });
+  save();
+  await ctx.reply(
+    `🎉 <b>Premium activated!</b>\n\nActive until <b>${fmtDate(until)}</b>.\n` +
+      `Enjoy Grok AI, odds checks, Top Picks and live goal alerts.\n\nTap /menu to continue.`,
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.command("paysupport", (ctx) =>
+  ctx.reply(
+    `💬 Payment help: contact ${process.env.SUPPORT_CONTACT || "the bot owner"} with your Telegram Stars payment details. Refunds are handled case by case.`
+  )
+);
+
+// ---------- ADMIN ----------
+bot.command("grant", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const [, id, days] = ctx.message.text.trim().split(/\s+/);
+  if (!/^\d+$/.test(id || "") || !(Number(days) > 0)) {
+    return ctx.reply("Usage: /grant <userId> <days>");
+  }
+  const until = addPremium(id, Number(days));
+  await ctx.reply(`✅ Premium for ${id} until ${fmtDate(until)}`);
+  bot.telegram.sendMessage(id, `🎁 You received 💎 Premium until ${fmtDate(until)}!`).catch(() => {});
+});
+
+bot.command("stats", (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const users = Object.keys(db.users).length;
+  const prem = Object.keys(db.premium).filter((id) => db.premium[id] > Date.now()).length;
+  const follows = Object.values(db.follow).reduce((n, a) => n + a.length, 0);
+  const stars = db.payments.reduce((n, p) => n + p.stars, 0);
+  return ctx.reply(
+    `📊 Stats\nUsers: ${users}\nActive premium: ${prem}\nMatch follows: ${follows}\nPayments: ${db.payments.length} (${stars} ⭐)`
+  );
+});
+
+// ---------- LIVE SCORES ----------
+const LIVE_COMPS = Object.keys(LEAGUES).join(",");
+const liveList = async () => {
+  const d = await api(`/matches?status=LIVE&competitions=${LIVE_COMPS}`, 45000);
+  return d.matches || [];
+};
+const sc = (m) => `${m.score?.fullTime?.home ?? 0}-${m.score?.fullTime?.away ?? 0}`;
+const nm = (t) => t.shortName || t.name;
+const stat = (m) =>
+  m.status === "PAUSED" ? "⏸ HT"
+  : m.status === "FINISHED" ? "🏁 FT"
+  : m.status === "IN_PLAY" || m.status === "LIVE" ? "🔴 LIVE"
+  : "⏳";
+const LAG_NOTE = "<i>Scores may lag a few minutes on the free data plan.</i>";
+
+async function liveView() {
+  const ms = (await liveList()).slice(0, 12);
+  const text = ms.length
+    ? `📡 <b>Live now</b>\n\n` +
+      ms
+        .map(
+          (m) =>
+            `${stat(m)} <b>${esc(nm(m.homeTeam))} ${sc(m)} ${esc(nm(m.awayTeam))}</b>\n<i>${esc(m.competition?.name || "")}</i>`
+        )
+        .join("\n\n") +
+      `\n\nTap a match for details 👇\n${LAG_NOTE}`
+    : `📡 <b>Live now</b>\n\n😴 No live matches right now.\n<i>Check back around kickoff time.</i>`;
+  const rows = ms.map((m) => [
+    Markup.button.callback(`${nm(m.homeTeam)} ${sc(m)} ${nm(m.awayTeam)}`, `lv:${m.id}`),
+  ]);
+  rows.push([Markup.button.callback("🔄 Refresh", "live")]);
+  rows.push([Markup.button.callback("⬅️ Home", "home")]);
+  return { text, kb: Markup.inlineKeyboard(rows) };
+}
+
+async function detailView(id, uid) {
+  const r = await api(`/matches/${id}`, 30000);
+  const m = r.match || r;
+  const following = (db.follow[uid] || []).includes(id);
+  const ht = m.score?.halfTime;
+  const text =
+    `${stat(m)} <b>${esc(nm(m.homeTeam))} ${sc(m)} ${esc(nm(m.awayTeam))}</b>\n` +
+    `🏆 ${esc(m.competition?.name || "")}\n` +
+    `🕒 Kickoff: ${kickoff(m.utcDate)} UTC\n` +
+    (ht && ht.home != null ? `⏱ Half-time: ${ht.home}-${ht.away}\n` : "") +
+    `\n🔔 Goal alerts: <b>${following ? "ON" : "OFF"}</b> 💎\n${LAG_NOTE}`;
+  const q = encodeURIComponent(`${nm(m.homeTeam)} vs ${nm(m.awayTeam)} highlights`);
+  return {
+    text,
+    kb: Markup.inlineKeyboard([
+      [Markup.button.callback(following ? "🔕 Stop alerts" : "🔔 Goal alerts 💎", `fl:${id}`)],
+      [Markup.button.url("🎬 Highlights", `https://www.youtube.com/results?search_query=${q}`)],
+      [Markup.button.callback("🔄 Refresh", `lv:${id}`)],
+      [Markup.button.callback("⬅️ Live", "live")],
+    ]),
+  };
+}
+
+bot.command("live", async (ctx) => {
+  try {
+    const v = await liveView();
+    await ctx.reply(v.text, { parse_mode: "HTML", ...v.kb });
+  } catch (e) {
+    fail(ctx, e);
+  }
+});
+
+bot.action("live", async (ctx) => {
+  await ctx.answerCbQuery();
+  try {
+    const v = await liveView();
+    await safeEdit(ctx, v.text, v.kb);
+  } catch (e) {
+    fail(ctx, e);
+  }
+});
+
+bot.action(/^lv:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  try {
+    const v = await detailView(Number(ctx.match[1]), ctx.from.id);
+    await safeEdit(ctx, v.text, v.kb);
+  } catch (e) {
+    fail(ctx, e);
+  }
+});
+
+// Toggle goal alerts for one match (premium)
+bot.action(/^fl:(\d+)$/, async (ctx) => {
+  if (!isPremium(ctx.from.id)) return wall(ctx, "Live goal alerts");
+  const id = Number(ctx.match[1]);
+  const uid = ctx.from.id;
+  const list = db.follow[uid] || [];
+  db.follow[uid] = list.includes(id) ? list.filter((x) => x !== id) : [...list, id].slice(-10);
+  save();
+  await ctx.answerCbQuery(list.includes(id) ? "🔕 Alerts off" : "🔔 Alerts on");
+  try {
+    const v = await detailView(id, uid);
+    await safeEdit(ctx, v.text, v.kb);
+  } catch (e) {
+    fail(ctx, e);
+  }
+});
+
+// ---------- LIVE POLLER (goal alerts + optional channel feed) ----------
+const liveState = new Map(); // matchId -> { score, status }
+const followersOf = (mid) =>
+  Object.entries(db.follow).filter(([, a]) => a.includes(mid)).map(([u]) => u);
+
+async function notify(mid, html, finished = false) {
+  for (const uid of followersOf(mid)) {
+    if (!isPremium(uid)) continue;
+    await bot.telegram.sendMessage(uid, html, { parse_mode: "HTML" }).catch(() => {});
+    if (finished) db.follow[uid] = db.follow[uid].filter((x) => x !== mid);
+  }
+  if (finished) save();
+  if (process.env.LIVE_CHANNEL) {
+    await bot.telegram
+      .sendMessage(process.env.LIVE_CHANNEL, html, { parse_mode: "HTML" })
+      .catch((e) => console.error("LIVE_CHANNEL post failed:", e.message));
+  }
+}
+
+async function pollLive() {
+  const hasFollowers = Object.values(db.follow).some((a) => a.length);
+  if (!hasFollowers && !process.env.LIVE_CHANNEL) return;
+  let ms;
+  try {
+    ms = await liveList();
+  } catch (e) {
+    return console.error("live poll failed:", e.message);
+  }
+  const seen = new Set();
+  for (const m of ms) {
+    seen.add(m.id);
+    const score = sc(m), status = m.status;
+    const prev = liveState.get(m.id);
+    liveState.set(m.id, { score, status, home: nm(m.homeTeam), away: nm(m.awayTeam) });
+    if (!prev) continue;
+    const line = `${esc(nm(m.homeTeam))} <b>${score}</b> ${esc(nm(m.awayTeam))}`;
+    if (prev.score !== score) await notify(m.id, `⚽ <b>GOAL!</b>\n${line}`);
+    else if (prev.status !== status && status === "PAUSED") await notify(m.id, `⏸ <b>Half-time</b>\n${line}`);
+    else if (prev.status === "PAUSED" && status === "IN_PLAY") await notify(m.id, `▶️ <b>Second half under way</b>\n${line}`);
+  }
+  // Matches that left the live list: confirm they finished before announcing
+  for (const [id, st] of [...liveState]) {
+    if (seen.has(id)) continue;
+    const audience = followersOf(id).length || process.env.LIVE_CHANNEL;
+    if (!audience) {
+      liveState.delete(id);
+      continue;
+    }
+    try {
+      const r = await api(`/matches/${id}`, 0);
+      const mm = r.match || r;
+      if (mm.status === "FINISHED") {
+        liveState.delete(id);
+        await notify(
+          id,
+          `🏁 <b>Full time</b>\n${esc(st.home)} <b>${sc(mm)}</b> ${esc(st.away)}`,
+          true
+        );
+      }
+    } catch (e) {
+      console.error("FT check failed:", e.message);
+    }
+  }
+}
 
 bot.action("home", async (ctx) => {
   await ctx.answerCbQuery();
@@ -452,7 +817,7 @@ bot.action(/^lg:(\w+)$/, async (ctx) => {
         `m:${code}:${m.homeTeam.id}:${m.awayTeam.id}`
       ),
     ]);
-    rows.unshift([Markup.button.callback("🔥 Top Picks (best confidence)", "top:" + code)]);
+    rows.unshift([Markup.button.callback("🔥 Top Picks 💎", "top:" + code)]);
     rows.push([Markup.button.callback("⬅️ Back", "home")]);
 
     await safeEdit(
@@ -468,6 +833,7 @@ bot.action(/^lg:(\w+)$/, async (ctx) => {
 // Top picks
 bot.action(/^top:(\w+)$/, async (ctx) => {
   const code = ctx.match[1];
+  if (!isPremium(ctx.from.id)) return wall(ctx, "Top Picks");
   await ctx.answerCbQuery("Ranking picks...");
   try {
     const d = await api(`/competitions/${code}/matches?status=SCHEDULED`, 600000);
@@ -541,7 +907,7 @@ bot.action(/^m:(\w+):(\d+):(\d+)$/, async (ctx) => {
         `<tg-spoiler>⚠️ Estimates only. Bet responsibly, 18+.</tg-spoiler>`,
       Markup.inlineKeyboard([
         [
-          Markup.button.callback("💰 Odds check", `o:${code}:${hid}:${aid}`),
+          Markup.button.callback("💰 Odds check 💎", `o:${code}:${hid}:${aid}`),
           Markup.button.callback("🤖 Grok AI", `g:${code}:${hid}:${aid}`),
         ],
         [Markup.button.callback("⬅️ Matches", "lg:" + code)],
@@ -557,6 +923,7 @@ bot.action(/^m:(\w+):(\d+):(\d+)$/, async (ctx) => {
 // Step 1: choose market
 bot.action(/^o:(\w+):(\d+):(\d+)$/, async (ctx) => {
   const [, code, hid, aid] = ctx.match;
+  if (!isPremium(ctx.from.id)) return wall(ctx, "Odds check");
   await ctx.answerCbQuery();
   pending.delete(ctx.from.id);
   try {
@@ -585,6 +952,7 @@ bot.action(/^o:(\w+):(\d+):(\d+)$/, async (ctx) => {
 // Step 2: choose odds (presets or type your own)
 bot.action(new RegExp(`^om:(\\w+):(\\d+):(\\d+):([${MK}])$`), async (ctx) => {
   const [, code, hid, aid, mk] = ctx.match;
+  if (!isPremium(ctx.from.id)) return wall(ctx, "Odds check");
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { code, hid, aid, mk, t: Date.now() });
   try {
@@ -614,6 +982,7 @@ bot.action(new RegExp(`^om:(\\w+):(\\d+):(\\d+):([${MK}])$`), async (ctx) => {
 // Step 3: result (preset button)
 bot.action(new RegExp(`^od:(\\w+):(\\d+):(\\d+):([${MK}]):([\\d.]+)$`), async (ctx) => {
   const [, code, hid, aid, mk, o] = ctx.match;
+  if (!isPremium(ctx.from.id)) return wall(ctx, "Odds check");
   await ctx.answerCbQuery();
   pending.delete(ctx.from.id);
   try {
@@ -650,58 +1019,70 @@ bot.on("text", async (ctx) => {
 });
 
 // ---------- GROK ANALYSIS ----------
+async function analysis(code, hid, aid) {
+  const d = await load(code, hid, aid);
+  if (!d) return null;
+  const { h, a, r } = d;
+  const [fh, fa] = await Promise.all([form(hid), form(aid)]);
+  const clean = (s) => s.replace(/🟩/g, "W").replace(/🟨/g, "D").replace(/🟥/g, "L");
+
+  const prompt =
+    `League: ${LEAGUES[code] || code}\n` +
+    `Match: ${h.name} (home) vs ${a.name} (away)\n` +
+    `${h.name}: position ${h.pos}, ${h.pts} pts, ${h.p} games, goals ${h.gf}:${h.ga}, last 5: ${clean(fh)}\n` +
+    `${a.name}: position ${a.pos}, ${a.pts} pts, ${a.p} games, goals ${a.gf}:${a.ga}, last 5: ${clean(fa)}\n` +
+    `Model probabilities: home ${pct(r.home)}, draw ${pct(r.draw)}, away ${pct(r.away)}, ` +
+    `over 2.5 ${pct(r.over25)}, BTTS ${pct(r.btts)}, likely score ${r.score}.\n\n` +
+    `Give a short match analysis: key factors, the main risk, and which market looks most sensible. ` +
+    `Mention that the model is a simple stats model.`;
+
+  return { h, a, text: await grok(prompt) };
+}
+
 bot.action(/^g:(\w+):(\d+):(\d+)$/, async (ctx) => {
   const [, code, hid, aid] = ctx.match;
+  const uid = ctx.from.id;
 
   if (!process.env.XAI_API_KEY) {
     return ctx.answerCbQuery("Grok is not set up (XAI_API_KEY missing).", { show_alert: true });
   }
-  const last = grokCooldown.get(ctx.from.id) || 0;
+  if (!isPremium(uid) && grokQuotaLeft(uid) <= 0) {
+    return wall(ctx, `More Grok analyses (free limit: ${FREE_GROK_PER_DAY} per day)`);
+  }
+  const last = grokCooldown.get(uid) || 0;
   if (Date.now() - last < 15000) {
     return ctx.answerCbQuery("Please wait a few seconds ⏳", { show_alert: true });
   }
-  grokCooldown.set(ctx.from.id, Date.now());
+  grokCooldown.set(uid, Date.now());
   await ctx.answerCbQuery("🤖 Grok is thinking...");
 
-  let d;
   try {
-    d = await load(code, hid, aid);
-    if (!d) return ctx.reply("📭 Not enough data.");
-  } catch (e) {
-    return fail(ctx, e);
-  }
+    const res = await analysis(code, hid, aid);
+    if (!res) return ctx.reply("📭 Not enough data.");
+    if (!isPremium(uid)) useGrokQuota(uid);
 
-  try {
-    const { h, a, r } = d;
-    const [fh, fa] = await Promise.all([form(hid), form(aid)]);
-    const clean = (s) => s.replace(/🟩/g, "W").replace(/🟨/g, "D").replace(/🟥/g, "L");
-
-    const prompt =
-      `League: ${LEAGUES[code] || code}\n` +
-      `Match: ${h.name} (home) vs ${a.name} (away)\n` +
-      `${h.name}: position ${h.pos}, ${h.pts} pts, ${h.p} games, goals ${h.gf}:${h.ga}, last 5: ${clean(fh)}\n` +
-      `${a.name}: position ${a.pos}, ${a.pts} pts, ${a.p} games, goals ${a.gf}:${a.ga}, last 5: ${clean(fa)}\n` +
-      `Model probabilities: home ${pct(r.home)}, draw ${pct(r.draw)}, away ${pct(r.away)}, ` +
-      `over 2.5 ${pct(r.over25)}, BTTS ${pct(r.btts)}, likely score ${r.score}.\n\n` +
-      `Give a short match analysis: key factors, the main risk, and which market looks most sensible. ` +
-      `Mention that the model is a simple stats model.`;
-
-    const text = await grok(prompt);
+    const quota = isPremium(uid)
+      ? ""
+      : `\n<i>Free analyses left today: ${grokQuotaLeft(uid)}. 💎 Premium = unlimited.</i>`;
 
     await safeEdit(
       ctx,
-      `🤖 <b>Grok AI analysis</b>\n⚽ ${esc(h.name)} vs ${esc(a.name)}\n\n` +
-        `<blockquote expandable>${esc(text).slice(0, 3000)}</blockquote>\n` +
+      `🤖 <b>Grok AI analysis</b>\n⚽ ${esc(res.h.name)} vs ${esc(res.a.name)}\n\n` +
+        `<blockquote expandable>${esc(res.text).slice(0, 3000)}</blockquote>${quota}\n` +
         `<tg-spoiler>⚠️ AI can be wrong. Estimates only. Bet responsibly, 18+.</tg-spoiler>`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("💰 Odds check", `o:${code}:${hid}:${aid}`)],
+        [Markup.button.callback("💰 Odds check 💎", `o:${code}:${hid}:${aid}`)],
         [Markup.button.callback("⬅️ Match", `m:${code}:${hid}:${aid}`)],
         [Markup.button.callback("🏠 Home", "home")],
       ])
     );
   } catch (e) {
     console.error(e);
-    ctx.reply("⚠️ Grok is unavailable right now. Check XAI_API_KEY, your xAI credits and GROK_MODEL.").catch(() => {});
+    ctx.reply(
+      String(e.message).includes("RATE_LIMIT")
+        ? "⏳ Too many requests to the football data API. Try again in a minute."
+        : "⚠️ Grok is unavailable right now. Check XAI_API_KEY, your xAI credits and GROK_MODEL."
+    ).catch(() => {});
   }
 });
 
@@ -730,7 +1111,7 @@ h1{font-size:20px;margin:0 0 4px}
 .track{flex:1;height:8px;border-radius:4px;background:rgba(127,127,127,.25);overflow:hidden}
 .fill{height:100%;background:var(--btn)}
 .v{width:38px;text-align:right}
-.meta{font-size:13px;margin-top:8px}
+.meta{font-size:13px;margin-top:8px;white-space:pre-wrap}
 .btn{margin-top:10px;border:0;border-radius:8px;padding:9px 12px;background:var(--btn);color:var(--btx);font-size:13px}
 select,input{width:100%;margin-top:8px;padding:9px;border-radius:8px;border:1px solid rgba(127,127,127,.4);background:var(--bg);color:var(--tx);font-size:14px}
 .res{margin-top:8px;font-size:13px}
@@ -762,6 +1143,8 @@ var MK = [
 ];
 var out = document.getElementById("out");
 var tabs = document.getElementById("tabs");
+var PREM = false;
+var CODE = "PL";
 
 function E(tag, cls, txt) {
   var e = document.createElement(tag);
@@ -810,12 +1193,31 @@ function card(m) {
   }
   sel.onchange = calc;
   inp.oninput = calc;
-  btn.onclick = function () { box.style.display = box.style.display === "none" ? "block" : "none"; };
+  var gres = E("div", "meta");
+  btn.onclick = function () {
+    if (!PREM) { gres.textContent = "💎 Odds check is a Premium feature. Open the bot and tap 💎 Premium."; return; }
+    box.style.display = box.style.display === "none" ? "block" : "none";
+  };
+  var gbtn = E("button", "btn", "🤖 Grok AI");
+  gbtn.style.marginLeft = "8px";
+  gbtn.onclick = function () {
+    gres.textContent = "🤖 Grok is thinking...";
+    fetch("/api/grok?code=" + CODE + "&h=" + m.hid + "&a=" + m.aid, { headers: { "x-init-data": initData } })
+      .then(function (r) { return r.json().then(function (j) { return { s: r.status, j: j }; }); })
+      .then(function (x) {
+        if (x.s === 200) gres.textContent = x.j.text;
+        else if (x.s === 402) gres.textContent = "💎 Free Grok limit reached for today. Open the bot and tap 💎 Premium for unlimited.";
+        else if (x.s === 429) gres.textContent = "Please wait a few seconds and try again.";
+        else gres.textContent = "Grok is unavailable right now.";
+      })
+      .catch(function () { gres.textContent = "Network error. Try again."; });
+  };
   box.appendChild(sel); box.appendChild(inp); box.appendChild(res);
-  c.appendChild(btn); c.appendChild(box);
+  c.appendChild(btn); c.appendChild(gbtn); c.appendChild(box); c.appendChild(gres);
   return c;
 }
 function load(code) {
+  CODE = code;
   msg("Loading matches...");
   fetch("/api/matches?code=" + code, { headers: { "x-init-data": initData } })
     .then(function (r) { return r.json().then(function (j) { return { s: r.status, j: j }; }); })
@@ -825,6 +1227,7 @@ function load(code) {
       if (x.s === 429) return msg("Too many requests. Try again in a minute.");
       if (x.s !== 200) return msg("Couldn't load matches. Try again shortly.");
       if (!x.j.matches.length) return msg("No upcoming matches found.");
+      PREM = !!x.j.premium;
       out.innerHTML = "";
       x.j.matches.forEach(function (m) { out.appendChild(card(m)); });
     })
@@ -900,6 +1303,8 @@ http
               if (!h || !a) return null;
               const r = predict(h, a, avg);
               return {
+                hid: m.homeTeam.id,
+                aid: m.awayTeam.id,
                 home: h.name,
                 away: a.name,
                 kickoff: kickoff(m.utcDate),
@@ -912,10 +1317,35 @@ http
               };
             })
             .filter(Boolean);
-          return sendJson(res, 200, { league: LEAGUES[code], matches });
+          return sendJson(res, 200, { league: LEAGUES[code], matches, premium: isPremium(user.id) });
         } catch (e) {
           console.error(e);
           return sendJson(res, String(e.message).includes("RATE_LIMIT") ? 429 : 500, { error: "api" });
+        }
+      }
+
+      if (url.pathname === "/api/grok") {
+        const user = verifyInitData(req.headers["x-init-data"] || "");
+        if (!user) return sendJson(res, 401, { error: "auth" });
+        const code = url.searchParams.get("code");
+        const h = url.searchParams.get("h"), a = url.searchParams.get("a");
+        if (!LEAGUES[code] || !/^\d+$/.test(h || "") || !/^\d+$/.test(a || "")) {
+          return sendJson(res, 400, { error: "params" });
+        }
+        const mem = await checkMembership(user.id);
+        if (!mem.ok) return sendJson(res, 403, { error: "join" });
+        if (!process.env.XAI_API_KEY) return sendJson(res, 503, { error: "grok" });
+        if (!isPremium(user.id) && grokQuotaLeft(user.id) <= 0) return sendJson(res, 402, { error: "premium" });
+        if (Date.now() - (grokCooldown.get(user.id) || 0) < 15000) return sendJson(res, 429, { error: "wait" });
+        grokCooldown.set(user.id, Date.now());
+        try {
+          const r = await analysis(code, h, a);
+          if (!r) return sendJson(res, 404, { error: "data" });
+          if (!isPremium(user.id)) useGrokQuota(user.id);
+          return sendJson(res, 200, { text: r.text });
+        } catch (e) {
+          console.error(e);
+          return sendJson(res, 500, { error: "grok" });
         }
       }
 
@@ -934,6 +1364,9 @@ bot.telegram
     { command: "start", description: "Open predictor" },
     { command: "menu", description: "Show leagues" },
     { command: "help", description: "Get help" },
+    { command: "live", description: "Live scores" },
+    { command: "premium", description: "Premium plans" },
+    { command: "paysupport", description: "Payment help" },
   ])
   .catch((e) => console.error("setMyCommands failed:", e.message));
 
@@ -944,6 +1377,7 @@ bot
     process.exit(1);
   });
 console.log("Predictor bot running...");
+setInterval(pollLive, 60000).unref();
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
